@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 require_relative './object_buffered_output'
 require_relative '../dns_resolver'
 
@@ -53,6 +54,7 @@ module Fluentd
         @rand_seed = Random.new.seed
         @weight_array = rebuild_balancing(@nodes)
 
+        ##################
         ###
         @nodes.each do |node|
           node.start(actor)
@@ -178,6 +180,29 @@ module Fluentd
         end
 
         ####################TODO ...
+        # https://gist.github.com/frsyuki/6191818
+        def start(actor)
+          # 1. execute udp heartbeat ack listener
+          # 2. execute tcp/udp hearbeat sender
+          # 3. connect to node if keepalive
+
+
+          actor.create_tcp_thread_server(@bind, @port, &method(:client_thread))
+
+          def client_thread(sock)
+            msg = sock.read
+            sock.write msg
+          ensure
+            sock.close
+          end
+
+          actor.every @interval do
+            collector.emit("ping", Time.now.to_i, {"ping"=>1})
+          end
+        end
+
+        # バックグラウンドでずっと能動的に動かしておきたいものactor#backgroundを使うといいらしい！
+
         def connection
           # with or without keepalive
         end
