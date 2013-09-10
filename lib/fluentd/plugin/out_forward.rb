@@ -1,10 +1,14 @@
-# -*- coding: utf-8 -*-
 require_relative './object_buffered_output'
 require_relative '../dns_resolver'
 
 module Fluentd
   module Plugin
     class ForwardOutput < ObjectBufferedOutput
+      NODE_STATUS_WATCH_INTERVAL = 1
+
+      KEEPALIVE_EXPIRED_WATCH_INTERVAL = 1
+      KEEPALIVE_MAINTAIN_CONNECTION_INTERVAL = 5
+
       Plugin.register_output('forward', self)
 
       config_param :send_timeout, :time, :default => 60
@@ -12,6 +16,7 @@ module Fluentd
       config_param :expire_dns_cache, :time, :default => nil # 0 means disalbe cache, nil means cache infinitely
 
       config_param :keepalive, :bool, :default => false
+      config_param :keepalive_time, :time, :default => nil # infinite
 
       config_param :heartbeat_type, :default => :udp do |val|
         case val.downcase
@@ -24,10 +29,10 @@ module Fluentd
       end
       config_param :heartbeat_interval, :time, :default => 1
 
-      config_param :failure_threshold, :integer, :default => 2
-      config_param :recover_threshold, :integer, :default => 3
+      config_param :failure_time, :time, :default => 3
+      config_param :recover_time, :time, :default => 5
 
-      attr_reader :nodes
+      attr_reader :nodes, :usock
 
       def initialize
         super
@@ -40,40 +45,54 @@ module Fluentd
       def configure(conf)
         super
 
-        @nodes = conf.elements.select{|e| e.name == 'server'}.map{|e| Node.new(e, self)}
+        if @heartbeat_type == :none && !@keepalive
+          raise ConfigError, "'heartbeat_type none' is available only with 'keepalive yes'"
+        end
+
+        @nodes = []
+        conf.elements.select{|e| e.name == 'server'}.each do |e|
+          n = Node.new(self)
+          n.configure(e)
+          @nodes.push(n)
+        end
         @nodes.each do |node|
           node.address # check not to raise ResolveError
         end
-
-        @mutex = Mutex.new
       end
 
       def start
+        @running = true
+
         @rand_seed = Random.new.seed
         @weight_array = rebuild_balancing(@nodes)
+        @rr = 0
 
-        ##################
-        ###
         @nodes.each do |node|
           node.start(actor)
         end
 
-        ###TODO: multi process ?
-        @usock = Fluentd.socket_manager.listen_udp(@bind, @port)
-        @usock.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
-        actor.watch_io(@usock, &method(:on_heartbeat_readable))
+        actor.every(NODE_STATUS_WATCH_INTERVAL) do
+          next unless @running
+
+          status_changed = @nodes.inject(false){ |r,a| a.check_alive! || r }
+          if status_changed
+            @weight_array = rebuild_balancing(@nodes)
+          end
+        end
 
         super
       end
 
-      def on_heartbeat_readable(sock)
-        begin
-          msg, addr = sock.recvfrom(1024)
-          ###TODO
-          # specify addr -> node
-          # update node as available
-        rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
-          return
+      def stop
+        @running = false
+        @nodes.each do |node|
+          node.stop
+        end
+      end
+
+      def shutdown
+        @nodes.each do |node|
+          node.shutdown
         end
       end
 
@@ -105,6 +124,7 @@ module Fluentd
         end
       end
 
+      #### TODO: check weight_array size to be equal with previous status for @rr node selection (node failure -> takeback)
       def rebuild_balancing(nodes)
         standby_nodes, using_nodes = nodes.partition {|n|
           n.standby?
@@ -143,39 +163,142 @@ module Fluentd
       end
 
       class Node
-        attr_reader :name, :host, :port, :weight, :standby, :keepalive, :ipv6
-        attr_accessor :available
+        include Configurable
 
-        def self.parse_bool(conf, name, default)
-          if conf.has_key?(name)
-            conf[name].nil? || ['true', 'yes'].include?(conf[name].downcase)
-          else
-            default
+        config_param :host, :string
+        config_param :port, :integer, :default => 24224
+
+        config_param :ipv6, :bool, :default => nil
+        config_param :expire_dns_cache, :time, :default => nil
+
+        config_param :weight, :integer, :default => 60
+        config_param :standby, :bool, :default => false
+
+        config_param :keepalive, :bool, :default => nil
+        config_param :keepalive_time, :time, :default => nil
+
+        config_param :send_timeout, :time, :default => nil
+        config_param :heartbeat_interval, :time, :default => nil
+
+        config_param :failure_time, :time, :default => nil
+        config_param :recover_time, :time, :default => nil
+
+        attr_reader :nodes, :usock
+
+        def initialize(parent)
+          super()
+          @parent = parent
+        end
+
+        def configure_parent_default(*params)
+          params.each do |param|
+            if self.send(param).nil?
+              self.send("#{param}=".to_sym, @parent.send(param))
+            end
           end
         end
 
-        def initialize(config, parent)
-          @host = config['host']
-          @port = config['port'].to_i
-          @name = config['name'] || "#{@host}:#{@port}"
+        def configure(conf)
+          init_configurable
+          super
 
-          @weight = config.has_key?('weight') ? config['weight'].to_i : 60
+          @name = "#{@host}:#{@port}"
+          @proto = @ipv6 ? :ipv6 : :ipv4
 
-          @standby = self.class.parse_bool(config, 'standby', false)
-          @keepalive = self.class.parse_bool(config, 'keepalive', parent.keepalive)
+          configure_parent_default :ipv6, :expire_dns_cache, :keepalive, :keepalive_time, \
+                                   :send_timeout, :heartbeat_interval, :failure_time, :recover_time
 
-          @proto = self.class.parse_bool(config, 'ipv6', parent.ipv6) ? :ipv6 : :ipv4
+          @heartbeat_type = @parent.heartbeat_type
 
-          @ipaddr_refresh_interval = parent.expire_dns_cache
+          @ipaddr_refresh_interval = @expire_dns_cache
           @ipaddr = nil # unresolved
           @ipaddr_expires = Time.now - 1
 
-          @available = true
+          @state = if @heartbeat_type != :none
+                     StateMachine.new(@failure_time, @recover_time)
+                   else
+                     nil
+                   end
         end
 
         def standby? ; @standby ; end
         def keepalive? ; @keepalive ; end
-        def available? ; @available ; end
+        def available? ; @state ? @state.available? : !!@connection ; end
+        def check_alive! ; @state.check! ; end
+        def update_alive! ; @state.update! ; end
+
+        def start(actor)
+          @running = true
+          @stopped = false
+
+          @state.start
+
+          @connection = nil
+          @connection_expired_at = nil
+          @expired_connections = []
+          @conn_mutex = Mutex.new
+
+          unless @heartbeat_type == :none
+            actor.every(@heartbeat_interval) do
+              if @running
+                send_heartbeat
+              end
+            end
+          end
+
+          if @heartbeat_type == :udp
+            #TODO: expiration with name expired
+            @usock = UDPSocket.new( @ipv6 ? Socket::AF_INET6 : Socket::AF_INET ) # Fluentd.socket_manager.listen_udp(self.address, @port)
+            @usock.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
+            actor.watch_io(@usock, &method(:on_udp_heartbeat_readable))
+          end
+
+          if @keepalive
+            # expired connection collector
+            actor.every(KEEPALIVE_EXPIRED_WATCH_INTERVAL) do
+              next if @stopped
+              garbages = @conn_mutex.synchronize do
+                expireds,@expired_connections = @expired_connections,[]
+                expireds
+              end
+              begin
+                garbages.each{|e| e.close }
+              rescue
+                # all errors are ignored for garbage sockets
+              end
+            end
+
+            # keepalive connection maintainer
+            actor.every(KEEPALIVE_MAINTAIN_CONNECTION_INTERVAL) do
+              next unless @running
+              connect do |c|
+                # do nothing and release connection immediately
+              end
+            end
+          end
+        end
+
+        def stop
+          @running = false
+        end
+
+        def shutdown
+          @stopped = true
+          begin
+            @connection.close if @connection
+          rescue => e
+            # ignore all errors with only logging
+            Fluentd.log.warn "error on connection closing in shutdown", :error_class => e.class, :error => e
+          end
+          @expired_connections.each do |c|
+            begin
+              c.lose
+            rescue => e
+              # ignore all errors with only logging
+              Fluentd.log.warn "error on expired connection closing in shutdown", :error_class => e.class, :error => e
+            end
+          end
+        end
 
         def address
           # 0 means disalbe cache, nil means cache infinitely
@@ -188,172 +311,195 @@ module Fluentd
           @ipaddr
         end
 
-        ####################TODO ...
-        # https://gist.github.com/frsyuki/6191818
-        def start(actor)
-          # 2. execute tcp/udp hearbeat sender
-          # 3. connect to node if keepalive
+        def open_tcp_socket
+          sock = TCPSocket.new(self.address, @port)
+          opt = [1, @send_timeout.to_i].pack('I!I!')  # { int l_onoff; int l_linger; }
+          sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, opt)
+          opt = [@send_timeout.to_i, 0].pack('L!L!')  # struct timeval
+          sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, opt)
+          sock
+        end
 
-        # actor.listen_tcp(@bind, @port) do |sock|
-        #   h = Handler.new(sock, method(:on_message))
-        #   actor.watch_io(sock, h.method(:on_readable))
-        # end
+        def connect(opts) # with block
+          raise ArgumentError, "connect needs block" unless block_given?
 
-          actor.create_tcp_thread_server(@bind, @port, &method(:client_thread))
+          ### In stop status (!@running), keepalive is disabled forcely
 
-          def client_thread(sock)
-            msg = sock.read
-            sock.write msg
-          ensure
-            sock.close
+          if opts[:new_sock] || !@keepalive || !@running
+            val = nil
+            begin
+              sock = open_tcp_socket
+              val = yield sock
+            ensure
+              sock.close
+            end
+            return val
           end
 
-          actor.every @interval do
-            collector.emit("ping", Time.now.to_i, {"ping"=>1})
+          # keepalive
+          @conn_mutex.synchronize do
+            if @connection && Time.now > @connection_expired_at
+              @expired_connections.push(@connection)
+              @connection = nil
+            end
+          end
+          begin
+            conn = @connection
+            unless conn
+              @connection = conn = open_tcp_socket # this may block
+              @connection_expired_at = Time.now + @keepalive_time
+            end
+            retval = yield conn
+            if conn != @connection # race condition on '@connection' and 'c'
+              @expired_connections.push(conn)
+            end
+            retval
+          rescue => e
+            # discard connection for any arrors
+            @conn_mutex.synchronize do
+              if conn == @connection
+                @connection = nil
+              end
+            end
+            @expired_connections.push(conn)
+            raise e
           end
         end
 
-        # バックグラウンドでずっと能動的に動かしておきたいものactor#backgroundを使うといいらしい！
-
-        def connection
-          # with or without keepalive
-        end
+        # MessagePack FixArray length = 2
+        FORWARD_HEADER = [0x92].pack('C')
 
         def send_data(tag, chunk)
+          begin
+            connect do |conn|
+              # beginArray(2)
+              conn.write FORWARD_HEADER
+              # writeRaw(tag)
+              conn.write tag.to_msgpack  # tag
+
+              # beginRaw(size)
+              sz = chunk.size
+
+              #if sz < 32
+              #  # FixRaw
+              #  sock.write [0xa0 | sz].pack('C')
+              #elsif sz < 65536
+              #  # raw 16
+              #  sock.write [0xda, sz].pack('Cn')
+              #else
+              # raw 32
+              conn.write [0xdb, sz].pack('CN')
+              #end
+
+              # writeRawBody(packed_es)
+              chunk.write_to(conn)
+            end
+            @state.update!
+          rescue SystemCallError => e #TODO: or each Errno::EXXX
+            Fluentd.log.error "failed to send data", :host => @host, :port => @port, :error_class => e.class, :error => e
+            raise e
+          end
         end
 
         def send_heartbeat
+          if @heartbeat_type == :tcp
+            send_tcp_heartbeat
+          elsif @heartbeat_type == :udp
+            send_udp_heartbeat
+          else
+            # :none
+          end
         end
 
+        # FORWARD_TCP_HEARTBEAT_DATA = FORWARD_HEADER + ''.to_msgpack + [].to_msgpack
         def send_tcp_heartbeat
+          begin
+            connect(:new_sock => true) do |conn|
+              opt = [1, @send_timeout.to_i].pack('I!I!')  # { int l_onoff; int l_linger; }
+              sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, opt)
+              opt = [@send_timeout.to_i, 0].pack('L!L!')  # struct timeval
+              sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, opt)
+
+              ### don't send any data to not cause a compatibility problem
+              #sock.write FORWARD_TCP_HEARTBEAT_DATA
+            end
+            # success to connect => receive ack packet => alive
+            @state.update!
+          rescue SystemCallError => e # or each Errno::EXXX
+            Fluentd.log.debug "failed to send tcp heartbeat", :error_class => e.class, :error => e
+          end
         end
 
         def send_udp_heartbeat
           begin
-            usock.send "\0", 0, host, port
+            @usock.send "\0", 0, self.address, @port
           rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
+            Fluentd.log.debug "failed to send udp heartbeat", :error_class => e.class, :error => e
           end
         end
 
-        def recv_udp_heartbeat # ?
-        end
-      end
-
-      ############################### in_forward code ##################
-      # message Entry {
-      #   1: long time
-      #   2: object record
-      # }
-      #
-      # message Forward {
-      #   1: string tag
-      #   2: list<Entry> entries
-      # }
-      #
-      # message PackedForward {
-      #   1: string tag
-      #   2: raw entries  # msgpack stream of Entry
-      # }
-      #
-      # message Message {
-      #   1: string tag
-      #   2: long? time
-      #   3: object record
-      # }
-      def on_message(msg)
-        if msg.nil?
-          # for future TCP heartbeat_request
-          return
-        end
-
-        # TODO format error
-        tag = msg[0].to_s
-        entries = msg[1]
-
-        if entries.class == String
-          # PackedForward
-          es = MessagePackEventCollection.new(entries, @cached_unpacker)
-          collector.emits(tag, es)
-
-        elsif entries.class == Array
-          # Forward
-          es = MultiEventCollection.new
-          entries.each {|e|
-            time = e[0].to_i
-            time = (now ||= Time.now.to_i) if time == 0
-            record = e[1]
-            es.add(time, record)
-          }
-          collector.emits(tag, es)
-
-        else
-          # Message
-          time = msg[1]
-          time = Time.now.to_i if time == 0
-          record = msg[2]
-          collector.emit(tag, time, record)
-        end
-      end
-
-      class Handler
-        def initialize(io, on_message)
-          @io = io
-          if @io.is_a?(TCPSocket)
-            opt = [1, @timeout.to_i].pack('I!I!')  # { int l_onoff; int l_linger; }
-            @io.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, opt)
-          end
-          $log.trace { "accepted fluent socket object_id=#{self.object_id}" }
-          @on_message = on_message
-          @buffer = ''
-        end
-
-        def on_readable
+        def on_udp_heartbeat_readable(sock)
           begin
-            data = @io.read_nonblock(32*1024, @buffer)
+            msg, addr = sock.recvfrom(1024)
           rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
             return
           end
-          on_read(data)
+
+          ipaddr,port = addr[3],addr[1]
+          if ipaddr != self.address || port != @port
+            raise RuntimeError, "WTF" #TODO: fix
+          end
+          node.update!
         end
 
-        def on_read(data)
-          first = data[0]
-          if first == '{' || first == '['
-            m = method(:on_read_json)
-            @y = Yajl::Parser.new
-            @y.on_parse_complete = @on_message
-          else
-            m = method(:on_read_msgpack)
-            @u = MessagePack::Unpacker.new
+        class StateMachine
+          # if available
+          #   failure_time passed without any successful updates -> unavailable
+          #     (updates: successful heartbeatings, successful data transferring)
+          # if unavailable
+          #   recover_time passed with continuous updates -> available
+          #     (continuous updates: all of update blank are shorter than failure_time)
+
+          # heartbeat none & keepalive -> none of this class's business
+
+          def initialize(failure_time, recover_time)
+            @failure_time = failure_time
+            @recover_time = recover_time
+            @available = true
           end
 
-          (class << self; self; end).module_eval do
-            define_method(:on_read, m)
+          def available? ; @available ; end
+
+          def start
+            @status_changed_at = @success_at = Time.now
           end
-          m.call(data)
-        end
 
-        def on_read_json(data)
-          @y << data
-        rescue
-          $log.error "forward error: #{$!.to_s}"
-          $log.error_backtrace
-          close
-        end
+          def check! # return true when status changed
+            t = Time.now
 
-        def on_read_msgpack(data)
-          @u.feed_each(data, &@on_message)
-        rescue
-          $log.error "forward error: #{$!.to_s}"
-          $log.error_backtrace
-          close
-        end
+            if @available
+              if t > @success_at + @failure_time
+                @available = false
+                @status_changed_at = t
+                return true
+              end
+            else
+              if t < @success_at + @failure_time && t > @status_changed_at + @recover_time
+                @available = true
+                @status_changed_at = t
+                return true
+              elsif t > @success_at + @failure_time
+                @status_changed_at = t
+              end
+            end
+          end
 
-        def on_close
-          $log.trace { "closed fluent socket object_id=#{self.object_id}" }
+          def update!
+            @success_at = Time.now
+          end
         end
       end
     end
-
   end
 end
+
