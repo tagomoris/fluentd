@@ -48,9 +48,7 @@ module Fluentd
         @mutex = Mutex.new
       end
 
-
       def start
-        # start?
         @rand_seed = Random.new.seed
         @weight_array = rebuild_balancing(@nodes)
 
@@ -60,16 +58,23 @@ module Fluentd
           node.start(actor)
         end
 
-        # @usock = Fluentd.socket_manager.listen_udp(@bind, @port)
-        # @usock.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
-        # actor.watch_io(@usock, &method(:on_heartbeat_readable))
-
-        # actor.listen_tcp(@bind, @port) do |sock|
-        #   h = Handler.new(sock, method(:on_message))
-        #   actor.watch_io(sock, h.method(:on_readable))
-        # end
+        ###TODO: multi process ?
+        @usock = Fluentd.socket_manager.listen_udp(@bind, @port)
+        @usock.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
+        actor.watch_io(@usock, &method(:on_heartbeat_readable))
 
         super
+      end
+
+      def on_heartbeat_readable(sock)
+        begin
+          msg, addr = sock.recvfrom(1024)
+          ###TODO
+          # specify addr -> node
+          # update node as available
+        rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
+          return
+        end
       end
 
       def write_objects(tag, chunk)
@@ -153,9 +158,12 @@ module Fluentd
           @host = config['host']
           @port = config['port'].to_i
           @name = config['name'] || "#{@host}:#{@port}"
+
           @weight = config.has_key?('weight') ? config['weight'].to_i : 60
+
           @standby = self.class.parse_bool(config, 'standby', false)
           @keepalive = self.class.parse_bool(config, 'keepalive', parent.keepalive)
+
           @proto = self.class.parse_bool(config, 'ipv6', parent.ipv6) ? :ipv6 : :ipv4
 
           @ipaddr_refresh_interval = parent.expire_dns_cache
@@ -166,6 +174,7 @@ module Fluentd
         end
 
         def standby? ; @standby ; end
+        def keepalive? ; @keepalive ; end
         def available? ; @available ; end
 
         def address
@@ -182,10 +191,13 @@ module Fluentd
         ####################TODO ...
         # https://gist.github.com/frsyuki/6191818
         def start(actor)
-          # 1. execute udp heartbeat ack listener
           # 2. execute tcp/udp hearbeat sender
           # 3. connect to node if keepalive
 
+        # actor.listen_tcp(@bind, @port) do |sock|
+        #   h = Handler.new(sock, method(:on_message))
+        #   actor.watch_io(sock, h.method(:on_readable))
+        # end
 
           actor.create_tcp_thread_server(@bind, @port, &method(:client_thread))
 
@@ -217,30 +229,17 @@ module Fluentd
         end
 
         def send_udp_heartbeat
+          begin
+            usock.send "\0", 0, host, port
+          rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
+          end
         end
 
         def recv_udp_heartbeat # ?
         end
       end
 
-      def on_heartbeat_readable(sock)
-        begin
-          msg, addr = sock.recvfrom(1024)
-        rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
-          return
-        end
-        host = addr[3]
-        port = addr[1]
-        send_heartbeat(sock, host, port)
-      end
-
-      def send_heartbeat(sock, host, port)
-        begin
-          usock.send "\0", 0, host, port
-        rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR
-        end
-      end
-
+      ############################### in_forward code ##################
       # message Entry {
       #   1: long time
       #   2: object record
