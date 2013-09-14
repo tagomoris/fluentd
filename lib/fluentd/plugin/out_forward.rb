@@ -276,6 +276,8 @@ module Fluentd
               end
             end
           end
+
+          actor.run
         end
 
         def stop

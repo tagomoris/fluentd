@@ -24,6 +24,9 @@ module Fluentd
     require_relative '../worker_global_methods'
 
     class Output < Agent
+      # provides #short_circuit
+      include Collector
+
       # provides #actor
       include Actor::AgentMixin
 

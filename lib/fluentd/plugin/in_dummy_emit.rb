@@ -14,16 +14,21 @@ module Fluentd
       end
 
       def start
+        super
+
         @running = true
         actor.every(@interval) do
           Fluentd.log.warn "hooooooooooooooooooooooo"
           next unless @running
           collector.emit(@tag, Time.now.to_i, @data)
         end
+
+        actor.run
       end
 
       def stop
         @running = false
+        super
       end
     end
   end
